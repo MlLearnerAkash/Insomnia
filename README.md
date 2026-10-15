@@ -37,7 +37,7 @@ macOS treats closing the lid as *mandatory* sleep. The usual tools do not help:
 - Warns when you enable it on battery, and can auto-revert if you unplug mid-session
 - Everything is logged to `/tmp/lidkeepawake.log` so you can verify what happened
 
-**What it does not do** — no privileged helper, no kernel extension, no network access, no telemetry, no auto-updater. It shells out to `pmset` and reads two IORegistry keys. That's the whole trick.
+**What it does not do** — no kernel extension, no network access, no telemetry, no auto-updater. The only privileged piece is an optional 90-line root-owned shell script (see below), which you can remove at any time.
 
 ---
 
@@ -84,17 +84,30 @@ open build/Insomnia.app
 
 The app has **no Dock icon and no window** — look for the **moon icon (`🌙 zzz`) in the menu bar**, left of the clock.
 
-**4. Install it permanently** (optional):
+**4. Install it permanently** (optional, and this is what removes the password prompts):
 
 ```sh
-./build_app.sh --install     # copies to /Applications, launch from Spotlight
+./build_app.sh --install
 ```
+
+This copies the app to `/Applications` **and** sets up the privileged helper, asking for your admin password **exactly once**. Launch it from Spotlight afterwards.
 
 **Prefer to run without a bundle?** `swift run -c release` also works, but without the `.app` bundle it cannot report its name and menu-bar behavior is less reliable — use the script.
 
+### Passwords: asked once, not every time
+
+Changing the system sleep setting means running `pmset` as root, so out of the box every toggle would prompt. `./build_app.sh --install` (or the app's **"Set up once — no more passwords"** button) fixes that permanently by installing two files:
+
+- `/usr/local/libexec/insomnia-helper` — a small root-owned shell script that does the sleep work
+- `/etc/sudoers.d/insomnia` — a rule letting *your* account run only that script without a password
+
+After that, toggling is instant and silent. The script accepts only five fixed subcommands (`ping`, `enable`, `enable-timer <seconds>`, `disable`, `cancel-timer`, plus an internal revert step) and validates every argument, so the rule cannot be used to run arbitrary commands as root — the worst it grants is keeping this Mac awake. Both files are root-owned and not writable by your user account.
+
+To go back to password-on-every-toggle: `./helper/uninstall_helper.sh` (or the app's **"Remove password-free helper"** button).
+
 ### First launch
 
-The first time you flip **"Keep running when lid is closed"**, macOS asks for your **admin password** (changing system sleep settings is root-only). That prompt may appear behind other windows — check for a hidden `osascript wants to make changes` dialog.
+With the helper set up, nothing prompts you. Without it, the first time you flip **"Keep running when lid is closed"** macOS asks for your **admin password** (that prompt may appear behind other windows — look for a hidden `osascript wants to make changes` dialog), and it asks again on every later toggle.
 
 If Gatekeeper complains (only likely when the folder arrived as a download), either right-click the app → **Open** → **Open**, or run:
 
@@ -107,7 +120,7 @@ xattr -dr com.apple.quarantine build/Insomnia.app
 ## Using it
 
 1. Plug in the charger (recommended — a fanless MacBook Air gets warm with the lid shut on battery).
-2. Click the menu bar icon → toggle **Keep running when lid is closed** → enter your password.
+2. Click the menu bar icon → toggle **Keep running when lid is closed**. If you have not set up the helper yet, do that first (button in the same popover, one password prompt ever).
 3. Close the lid. The screen goes off; VS Code, SSH connections and anything else keep running.
 4. Open the lid → the screen comes back and everything behaves normally.
 5. Turn the toggle off when you're finished (or set a **Timer** instead and let it revert itself).
@@ -139,17 +152,21 @@ pmset -g log | grep -i "sleep" | tail -5
 ```
 Insomnia/
 ├── Package.swift          # SwiftPM manifest (executable target)
-├── build_app.sh           # build → Insomnia.app → ad-hoc sign
+├── build_app.sh           # build → Insomnia.app → ad-hoc sign (--install: + helper)
 ├── Info.plist             # reference copy of the bundle plist
 ├── README.md
+├── helper/
+│   ├── insomnia-helper    # the root-owned privileged script
+│   ├── install_helper.sh  # installs it + /etc/sudoers.d/insomnia (one prompt)
+│   └── uninstall_helper.sh
 ├── Sources/
 │   └── LidKeepAwake/
-│       └── main.swift     # the entire app (~600 lines)
+│       └── main.swift     # the entire app (~650 lines)
 └── build/
     └── Insomnia.app       # build output
 ```
 
-Everything lives in `main.swift`: power/`pmset` control, the root-side timer job, lid + display state, SSH keepalive, and the two-page SwiftUI menu bar UI.
+Everything lives in `main.swift`: power/`pmset` control, the root-side timer job, lid + display state, SSH keepalive, and the two-page SwiftUI menu bar UI. The three scripts under `helper/` are bundled into the app so the one-time setup button works on any machine.
 
 ---
 
@@ -163,6 +180,8 @@ Everything lives in `main.swift`: power/`pmset` control, the root-side timer job
 
 **SSH still drops.** Confirm the keepalive landed (`grep ServerAlive ~/.ssh/config`), then check the idle timeout on the *remote* side and any VPN/firewall in between. For long sessions, run your work inside `tmux` or `screen` on the remote host so the process outlives the connection.
 
+**It still asks for my password on every toggle.** The helper isn't installed (or its rule was removed). Run `./build_app.sh --install`, or click **"Set up once — no more passwords"** in the popover; the **Password** row should then read *"Never asked — helper installed"*. Verify from a terminal with `sudo -n /usr/local/libexec/insomnia-helper ping` — it prints `ok` with no prompt.
+
 **The Mac slept anyway.** The mode was not armed when the lid closed (the timer expired, or auto-revert fired). The log shows exactly which.
 
 ---
@@ -173,15 +192,18 @@ Everything lives in `main.swift`: power/`pmset` control, the root-side timer job
 # 1. Restore normal sleep
 sudo pmset -a disablesleep 0
 
-# 2. Quit and remove the app
+# 2. Remove the privileged helper and its passwordless rule, if you installed them
+sudo ./helper/uninstall_helper.sh
+
+# 3. Quit and remove the app
 pkill -f Insomnia.app
 rm -rf /Applications/Insomnia.app build/Insomnia.app
 
-# 3. Clean up runtime state
+# 4. Clean up runtime state
 sudo rm -rf /var/tmp/lidkeepawake
 rm -f /tmp/lidkeepawake.log
 
-# 4. Optional: remove the SSH keepalive block from ~/.ssh/config
+# 5. Optional: remove the SSH keepalive block from ~/.ssh/config
 #    (delete the lines between "# >>> LidKeepAwake keepalive >>>" and
 #     "# <<< LidKeepAwake keepalive <<<"); a backup is at
 #     ~/.ssh/config.lidkeepawake.bak

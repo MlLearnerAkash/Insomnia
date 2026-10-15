@@ -135,22 +135,80 @@ enum SleepCtl {
         + "; /bin/rm -f \(jobDir)/gen.* \(jobDir)/pid"
     }
 
-    /// Runs a shell command as root. First tries passwordless sudo (fast path,
-    /// no prompt), then falls back to an admin password dialog.
-    /// Returns nil on success, or a human-readable error message.
-    static func runElevated(shell: String) async -> String? {
-        // Fast path: cached sudo credentials (cannot prompt this way).
-        let sudo = Process()
-        sudo.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        sudo.arguments = ["-n", "/bin/sh", "-c", shell]
-        sudo.standardOutput = Pipe()
-        sudo.standardError = Pipe()
-        if (try? sudo.run()) != nil {
-            sudo.waitUntilExit()
-            if sudo.terminationStatus == 0 { return nil }
+    // MARK: Privileged operations
+
+    /// Where `./build_app.sh --install` (or the app's one-time setup button)
+    /// puts the root-owned helper.
+    static let helperPath = "/usr/local/libexec/insomnia-helper"
+
+    static var helperInstalled: Bool {
+        FileManager.default.isExecutableFile(atPath: helperPath)
+    }
+
+    /// One privileged operation, expressed twice: as helper subcommands (the
+    /// password-free path) and as a root shell (the fallback used when the
+    /// helper has not been installed yet).
+    enum Op {
+        case enable
+        case enableTimer(Int)
+        case disable
+        case cancelTimer
+
+        var helperArgs: [String] {
+            switch self {
+            case .enable: return ["enable"]
+            case .enableTimer(let seconds): return ["enable-timer", String(seconds)]
+            case .disable: return ["disable"]
+            case .cancelTimer: return ["cancel-timer"]
+            }
         }
 
-        // Slow path: AppleScript admin prompt.
+        var shell: String {
+            switch self {
+            case .enable: return SleepCtl.enableShell(timerSeconds: nil)
+            case .enableTimer(let seconds): return SleepCtl.enableShell(timerSeconds: seconds)
+            case .disable: return SleepCtl.disableShell()
+            case .cancelTimer: return SleepCtl.cancelTimerShell()
+            }
+        }
+    }
+
+    /// Runs sudo with `-n`, which never prompts. Returns nil on success, or the
+    /// error text.
+    private static func runSudo(_ args: [String]) -> String? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        task.arguments = args
+        let out = Pipe()
+        let err = Pipe()
+        task.standardOutput = out
+        task.standardError = err
+        guard (try? task.run()) != nil else { return "Could not run sudo." }
+        task.waitUntilExit()
+        if task.terminationStatus == 0 { return nil }
+        let message = (String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? "sudo exited with code \(task.terminationStatus)." : message
+    }
+
+    /// Runs one privileged operation.
+    ///
+    /// 1. Through the installed helper — no password, ever (the point of the
+    ///    one-time setup).
+    /// 2. Through cached sudo credentials — still no prompt.
+    /// 3. Otherwise a one-off admin password dialog, so the app works before
+    ///    the helper is installed.
+    static func runElevated(_ op: Op) async -> String? {
+        if helperInstalled, runSudo(["-n", helperPath] + op.helperArgs) == nil {
+            return nil
+        }
+        if runSudo(["-n", "/bin/sh", "-c", op.shell]) == nil { return nil }
+        return runWithAdminPrompt(op.shell)
+    }
+
+    /// Runs a root shell after asking for an admin password. Used for the
+    /// helper setup itself, and as the fallback above.
+    static func runWithAdminPrompt(_ shell: String) -> String? {
         let escaped = shell
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -172,6 +230,11 @@ enum SleepCtl {
         } catch {
             return error.localizedDescription
         }
+    }
+
+    /// Wraps a path or argument in single quotes for safe use in a shell string.
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 
@@ -334,6 +397,9 @@ final class AppState: ObservableObject {
     @Published var statusMessage: String?
     @Published var autoRevertOnBattery = true
     @Published var sshKeepaliveConfigured = false
+    /// True once the one-time privileged helper is installed, which is what
+    /// makes toggling password-free.
+    @Published var helperInstalled = false
     /// Live hardware lid state (nil when the Mac has no lid sensor).
     @Published var lidClosed: Bool?
     /// Live display power state (true = panel is off).
@@ -530,6 +596,7 @@ final class AppState: ObservableObject {
         powerSource = newSource
         vscodeRunning = VSCode.isRunning
         sshKeepaliveConfigured = SSHKeepalive.isConfigured
+        helperInstalled = SleepCtl.helperInstalled
         let disabled = SleepCtl.isSleepDisabled()
         if disabled != sleepDisabled {
             sleepDisabled = disabled
@@ -556,7 +623,7 @@ final class AppState: ObservableObject {
         busy = true
         defer { busy = false }
         let errorText = await SleepCtl.runElevated(
-            shell: on ? SleepCtl.enableShell(timerSeconds: nil) : SleepCtl.disableShell()
+            on ? .enable : .disable
         )
         if errorText == nil {
             sleepDisabled = on
@@ -583,7 +650,7 @@ final class AppState: ObservableObject {
         let seconds = pendingSeconds
         busy = true
         defer { busy = false }
-        let errorText = await SleepCtl.runElevated(shell: SleepCtl.enableShell(timerSeconds: seconds))
+        let errorText = await SleepCtl.runElevated(.enableTimer(seconds))
         if errorText == nil {
             sleepDisabled = true
             timerTotal = TimeInterval(seconds)
@@ -602,7 +669,7 @@ final class AppState: ObservableObject {
         busy = true
         defer { busy = false }
         let errorText = await SleepCtl.runElevated(
-            shell: andSleep ? SleepCtl.disableShell() : SleepCtl.cancelTimerShell()
+            andSleep ? .disable : .cancelTimer
         )
         if errorText == nil {
             clearTimer()
@@ -623,6 +690,50 @@ final class AppState: ObservableObject {
             statusMessage = SSHKeepalive.isOurs
                 ? "SSH keepalive added to ~/.ssh/config. New terminals use it automatically."
                 : "You already have SSH keepalive settings — left untouched."
+        }
+        refresh()
+    }
+
+    /// Installs the helper if the bundle carries it, so one password prompt at
+    /// setup removes the prompt from every later toggle.
+    func installHelper() async {
+        guard !busy else { return }
+        guard let script = Bundle.main.resourceURL?
+            .appendingPathComponent("install_helper.sh").path,
+            FileManager.default.isExecutableFile(atPath: script) else {
+            statusMessage = "Helper installer not found — run ./build_app.sh --install from the project folder."
+            return
+        }
+        busy = true
+        defer { busy = false }
+        Diag.log("installing privileged helper (one-time)")
+        let shell = "/bin/sh \(SleepCtl.shellQuoted(script)) \(SleepCtl.shellQuoted(NSUserName()))"
+        if let error = SleepCtl.runWithAdminPrompt(shell) {
+            Diag.log("helper install failed: \(error)")
+            statusMessage = "Setup failed: \(error)"
+        } else {
+            helperInstalled = SleepCtl.helperInstalled
+            Diag.log("helper installed: \(helperInstalled)")
+            statusMessage = helperInstalled
+                ? "Done — toggling no longer asks for a password."
+                : "Installer ran but the helper is missing. Try ./build_app.sh --install."
+        }
+        refresh()
+    }
+
+    /// Removes the helper and its sudoers rule; toggling asks for a password
+    /// again afterwards.
+    func removeHelper() async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        Diag.log("removing privileged helper")
+        let shell = "/bin/rm -f /etc/sudoers.d/insomnia \(SleepCtl.shellQuoted(SleepCtl.helperPath))"
+        if let error = SleepCtl.runWithAdminPrompt(shell) {
+            statusMessage = "Could not remove the helper: \(error)"
+        } else {
+            helperInstalled = SleepCtl.helperInstalled
+            statusMessage = "Helper removed — toggling asks for your password again."
         }
         refresh()
     }
@@ -750,6 +861,10 @@ struct MenuView: View {
                   detail: app.sshKeepaliveConfigured ? "Configured" : "Not set",
                   ok: app.sshKeepaliveConfigured)
 
+        statusRow(icon: "lock.shield", title: "Password",
+                  detail: app.helperInstalled ? "Never asked — helper installed" : "Asked on every toggle",
+                  ok: app.helperInstalled)
+
         Divider()
 
         Toggle("Keep running when lid is closed", isOn: Binding(
@@ -760,7 +875,9 @@ struct MenuView: View {
         ))
         .toggleStyle(.switch)
         .disabled(app.busy)
-        .help("Disables system sleep so background apps like VS Code survive lid close. Blocking sleep needs an admin password; restoring it needs one too.")
+        .help(app.helperInstalled
+              ? "Disables system sleep so background apps like VS Code survive lid close."
+              : "Disables system sleep so background apps like VS Code survive lid close. Blocking sleep needs an admin password until the one-time helper is installed.")
 
         Text("Close the lid any time: the screen goes off and VS Code + SSH keep running in the background.")
             .font(.caption)
@@ -786,6 +903,26 @@ struct MenuView: View {
             }
             .buttonStyle(.borderless)
             .help("Adds ServerAliveInterval to ~/.ssh/config so Remote-SSH sessions survive idle NAT/firewall timeouts. Your config is backed up first.")
+        }
+
+        if !app.helperInstalled {
+            Button {
+                Task { await app.installHelper() }
+            } label: {
+                Label("Set up once — no more passwords", systemImage: "lock.shield")
+            }
+            .buttonStyle(.borderless)
+            .disabled(app.busy)
+            .help("Asks for your admin password one last time, then installs a small root-owned helper. Every later toggle is password-free.")
+        } else {
+            Button {
+                Task { await app.removeHelper() }
+            } label: {
+                Label("Remove password-free helper", systemImage: "trash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(app.busy)
+            .help("Deletes the helper and its rule. Toggling will ask for your password again.")
         }
 
         if !app.vscodeRunning {

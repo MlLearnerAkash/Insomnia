@@ -25,8 +25,21 @@ swift build -c release
 
 echo "==> Assembling ${OUT}"
 rm -rf "$OUT"
-mkdir -p "$OUT/Contents/MacOS"
+mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 cp ".build/release/${EXECUTABLE}" "$OUT/Contents/MacOS/${EXECUTABLE}"
+
+# The privileged helper travels inside the bundle so the app can offer a
+# one-time "install helper" button without needing the source folder.
+cp helper/insomnia-helper helper/install_helper.sh helper/uninstall_helper.sh \
+   "$OUT/Contents/Resources/"
+chmod 755 "$OUT/Contents/Resources/insomnia-helper" \
+          "$OUT/Contents/Resources/install_helper.sh" \
+          "$OUT/Contents/Resources/uninstall_helper.sh"
+
+echo "==> Checking helper script syntax"
+for script in helper/insomnia-helper helper/install_helper.sh helper/uninstall_helper.sh; do
+  sh -n "$script" || { echo "error: $script has a syntax error" >&2; exit 1; }
+done
 
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -69,9 +82,12 @@ echo "Built ${OUT}"
 echo "Run it with:  open ${OUT}"
 
 if [[ "${1:-}" == "--install" ]]; then
-  echo "==> Installing to /Applications"
-  rm -rf "/Applications/${APP_NAME}.app"
-  cp -R "$OUT" "/Applications/${APP_NAME}.app"
+  echo "==> Installing to /Applications and setting up the privileged helper"
+  echo "    (one admin password prompt — nothing else will ask again)"
+  # Single sudo invocation so the password is asked exactly once.
+  sudo sh -c "rm -rf /Applications/${APP_NAME}.app && cp -R '${OUT}' '/Applications/${APP_NAME}.app' && ./helper/install_helper.sh"
+  echo
   echo "Installed /Applications/${APP_NAME}.app"
+  echo "Helper installed — toggling no longer asks for a password."
   echo "Launch it from Spotlight (${APP_NAME}) or: open -a ${APP_NAME}"
 fi

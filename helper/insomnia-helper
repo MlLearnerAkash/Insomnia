@@ -1,0 +1,101 @@
+#!/bin/sh
+#
+# insomnia-helper — the only privileged piece of Insomnia.
+#
+# Installed once as root (by `./build_app.sh --install`, or by the app's
+# "Install one-time helper" button). Insomnia then runs it through a
+# passwordless sudo rule, so toggling the sleep setting never prompts again.
+#
+# Security: this file is root-owned and root-only writable, and it accepts only
+# the fixed subcommands below with validated arguments. The sudoers rule grants
+# no arbitrary command execution — the worst a local process can do with it is
+# keep this Mac awake or let it sleep.
+#
+#   insomnia-helper ping
+#   insomnia-helper enable                  block sleep until told otherwise
+#   insomnia-helper enable-timer <seconds>  block sleep, restore after <seconds>
+#   insomnia-helper disable                 restore normal sleep
+#   insomnia-helper cancel-timer            drop the countdown, stay awake
+#   insomnia-helper revert-if-current <gen> internal: used by the root timer job
+
+set -u
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+JOB_DIR=/var/tmp/lidkeepawake
+PMSET=/usr/bin/pmset
+SELF="$0"
+
+die() { echo "insomnia-helper: $1" >&2; exit 1; }
+
+# Kills the pending countdown job (if any) and removes its markers.
+cancel_job() {
+    if [ -f "$JOB_DIR/pid" ]; then
+        kill "$(cat "$JOB_DIR/pid")" 2>/dev/null
+    fi
+    rm -f "$JOB_DIR"/gen.* "$JOB_DIR/pid" 2>/dev/null
+}
+
+prepare_dir() {
+    mkdir -p "$JOB_DIR" || die "could not create $JOB_DIR"
+    chmod 700 "$JOB_DIR"
+}
+
+case "${1:-}" in
+    ping)
+        [ "$#" -eq 1 ] || die "usage: ping"
+        echo ok
+        ;;
+
+    enable)
+        [ "$#" -eq 1 ] || die "usage: enable"
+        prepare_dir
+        cancel_job
+        "$PMSET" -a disablesleep 1 || die "pmset could not block sleep"
+        ;;
+
+    enable-timer)
+        [ "$#" -eq 2 ] || die "usage: enable-timer <seconds>"
+        case "$2" in
+            ''|*[!0-9]*) die "seconds must be a positive integer" ;;
+        esac
+        [ "$2" -gt 0 ] || die "seconds must be a positive integer"
+        prepare_dir
+        cancel_job
+        "$PMSET" -a disablesleep 1 || die "pmset could not block sleep"
+        # Generation marker: if it is gone when the countdown ends (cancelled, or
+        # a newer session started), the job leaves the setting alone.
+        gen="$JOB_DIR/gen.$(date +%s)"
+        : > "$gen" || die "could not create the generation marker"
+        nohup /bin/sh -c "sleep $2; exec '$SELF' revert-if-current '$gen'" \
+            >/dev/null 2>&1 &
+        echo $! > "$JOB_DIR/pid"
+        ;;
+
+    revert-if-current)
+        [ "$#" -eq 2 ] || die "usage: revert-if-current <marker>"
+        marker="$2"
+        case "$marker" in
+            /var/tmp/lidkeepawake/gen.*) ;;
+            *) die "bad marker path" ;;
+        esac
+        if [ -f "$marker" ]; then
+            "$PMSET" -a disablesleep 0
+        fi
+        rm -f "$marker" "$JOB_DIR/pid"
+        ;;
+
+    disable)
+        [ "$#" -eq 1 ] || die "usage: disable"
+        cancel_job
+        "$PMSET" -a disablesleep 0 || die "pmset could not restore sleep"
+        ;;
+
+    cancel-timer)
+        [ "$#" -eq 1 ] || die "usage: cancel-timer"
+        cancel_job
+        ;;
+
+    *)
+        die "unknown command: ${1:-} (expected ping|enable|enable-timer|disable|cancel-timer)"
+        ;;
+esac
