@@ -94,6 +94,17 @@ This copies the app to `/Applications` **and** sets up the privileged helper, as
 
 **Prefer to run without a bundle?** `swift run -c release` also works, but without the `.app` bundle it cannot report its name and menu-bar behavior is less reliable — use the script.
 
+### Packaging and releasing (`.dmg`)
+
+```sh
+./build_app.sh --dmg                 # → build/Insomnia-1.0.dmg
+gh release create v1.0 build/Insomnia-1.0.dmg --title "Insomnia v1.0" --notes "..."
+```
+
+The flag stages the app next to an `/Applications` symlink (the usual drag-to-install layout), compresses it, then mounts the image to confirm the app and symlink are really inside before finishing. Flags combine, so `./build_app.sh --dmg --install` packages and installs in one go.
+
+**A caveat for releases:** the app is ad-hoc signed (no Developer ID, no notarization). Downloaders will see Gatekeeper warn, so your release notes should say *right-click the app → Open* the first time, or `xattr -dr com.apple.quarantine /Applications/Insomnia.app`. Notarization requires a paid Apple Developer account.
+
 ### Passwords: asked once, not every time
 
 Changing the system sleep setting means running `pmset` as root, so out of the box every toggle would prompt. `./build_app.sh --install` (or the app's **"Set up once — no more passwords"** button) fixes that permanently by installing two files:

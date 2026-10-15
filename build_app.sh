@@ -3,7 +3,10 @@
 # Builds Insomnia.app (a menu bar app) from source.
 #
 #   ./build_app.sh              build into build/Insomnia.app
-#   ./build_app.sh --install    also copy it to /Applications
+#   ./build_app.sh --dmg        also package build/Insomnia-<version>.dmg
+#   ./build_app.sh --install    also copy it to /Applications (+ privileged helper)
+#
+# Flags can be combined: ./build_app.sh --dmg --install
 #
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -11,7 +14,20 @@ cd "$(dirname "$0")"
 APP_NAME="Insomnia"
 BUNDLE_ID="com.local.insomnia"
 EXECUTABLE="LidKeepAwake"   # SwiftPM product name (internal)
+VERSION="1.0"
 OUT="build/${APP_NAME}.app"
+DMG="build/${APP_NAME}-${VERSION}.dmg"
+
+WANT_DMG=0
+WANT_INSTALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --dmg)     WANT_DMG=1 ;;
+    --install) WANT_INSTALL=1 ;;
+    -h|--help) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "error: unknown option: $arg (try --dmg, --install)" >&2; exit 1 ;;
+  esac
+done
 
 echo "==> Checking toolchain"
 if ! command -v swift >/dev/null 2>&1; then
@@ -53,9 +69,9 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>${EXECUTABLE}</string>
     <key>CFBundlePackageType</key>
@@ -81,7 +97,37 @@ echo
 echo "Built ${OUT}"
 echo "Run it with:  open ${OUT}"
 
-if [[ "${1:-}" == "--install" ]]; then
+if (( WANT_DMG )); then
+  echo
+  echo "==> Packaging ${DMG}"
+  # A staging folder gives the DMG the usual drag-to-Applications layout:
+  # the app, plus a symlink that looks like the Applications folder.
+  STAGE="build/dmg"
+  rm -rf "$STAGE" "$DMG"
+  mkdir -p "$STAGE"
+  cp -R "$OUT" "$STAGE/"
+  ln -s /Applications "$STAGE/Applications"
+
+  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+  rm -rf "$STAGE"
+
+  # Verify the image mounts and really contains the app and the symlink.
+  MOUNT=$(hdiutil attach -nobrowse -readonly "$DMG" | awk '/\/Volumes\//{for (i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}')
+  if [[ -d "$MOUNT/${APP_NAME}.app" && -L "$MOUNT/Applications" ]]; then
+    echo "    image OK: ${APP_NAME}.app + Applications symlink present"
+  else
+    echo "    warning: image contents look wrong" >&2
+  fi
+  hdiutil detach -quiet "$MOUNT"
+
+  echo "    ${DMG} ($(du -h "$DMG" | awk '{print $1}'))"
+  echo
+  echo "Unsigned build: tell users to right-click the app → Open the first time."
+  echo "Release it with:  gh release create v${VERSION} ${DMG} --title \"${APP_NAME} v${VERSION}\""
+fi
+
+if (( WANT_INSTALL )); then
+  echo
   echo "==> Installing to /Applications and setting up the privileged helper"
   echo "    (one admin password prompt — nothing else will ask again)"
   # Single sudo invocation so the password is asked exactly once.
